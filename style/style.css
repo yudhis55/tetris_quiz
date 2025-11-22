@@ -1,0 +1,173 @@
+
+    body { box-sizing: border-box; }
+
+    .tetris-block {
+      width: 20px;
+      height: 20px;
+      border: 1px solid #333;
+    }
+
+    .game-board {
+      display: grid;
+      grid-template-columns: repeat(10, 20px);
+      grid-template-rows: repeat(20, 20px);
+      gap: 1px;
+      background: #000;
+      border: 2px solid #333;
+    }
+
+    .next-piece {
+      display: grid;
+      grid-template-columns: repeat(4, 15px);
+      grid-template-rows: repeat(4, 15px);
+      gap: 1px;
+      background: #222;
+      border: 1px solid #444;
+    }
+
+    .quiz-modal {
+      backdrop-filter: blur(4px);
+    }
+
+    .mini-block {
+      width: 10px;
+      height: 10px;
+      border: 1px solid #555;
+      box-sizing: border-box;
+    }
+
+    .fade-in {
+      animation: fadeIn 0.3s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: scale(.95); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+
+    /* Mobile Controls */
+    .mobile-controls { display: none; }
+
+    @media (max-width: 768px) {
+      .mobile-controls { display: block; }
+
+      .mobile-btn {
+        padding: 12px;
+        font-size: 20px;
+        border-radius: 8px;
+        color: white;
+        font-weight: bold;
+        touch-action: manipulation;
+        user-select: none;
+      }
+
+      .mobile-btn:active { transform: scale(.95); }
+
+      .game-board {
+        transform: scale(.85);
+        transform-origin: top center;
+        margin-bottom: 8px;
+      }
+
+      .tetris-block {
+        width: 18px;
+        height: 18px;
+      }
+
+      header { margin-bottom: 12px !important; }
+      header h1 { font-size: 1.5rem !important; }
+      .player-info-mobile { font-size: .75rem !important; }
+      .stats-mobile { font-size: .875rem !Important; padding: 6px 12px !important; }
+    }
+
+    @media (max-width: 640px) {
+      .game-board {
+        transform: scale(.75);
+        margin-bottom: 4px;
+      }
+
+      header { margin-bottom: 8px !important; }
+      header h1 { font-size: 1.25rem !important; }
+    }
+  
+
+    /* Dekorasi Tetris untuk login & game */
+    .floating-tetris-block {
+      position: absolute;
+      width: 80px;
+      height: 80px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 2px;
+      opacity: 0.9;
+      filter: drop-shadow(0 0 12px rgba(0, 0, 0, 0.6));
+    }
+
+    .block-1 {
+      top: 8%;
+      left: 6%;
+      animation: floatBlock1 9s ease-in-out infinite;
+    }
+    .block-2 {
+      top: 70%;
+      left: 10%;
+      animation: floatBlock2 11s ease-in-out infinite;
+    }
+    .block-3 {
+      top: 15%;
+      right: 8%;
+      animation: floatBlock3 10s ease-in-out infinite;
+    }
+    .block-4 {
+      bottom: 5%;
+      right: 18%;
+      animation: floatBlock4 12s ease-in-out infinite;
+    }
+
+    .t-mini-block {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+    }
+
+    @keyframes floatBlock1 {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      50% { transform: translateY(15px) rotate(3deg); }
+    }
+    @keyframes floatBlock2 {
+      0%, 100% { transform: translateY(0) rotate(-2deg); }
+      50% { transform: translateY(-15px) rotate(1deg); }
+    }
+    @keyframes floatBlock3 {
+      0%, 100% { transform: translateY(0) rotate(2deg); }
+      50% { transform: translateY(18px) rotate(-3deg); }
+    }
+    @keyframes floatBlock4 {
+      0%, 100% { transform: translateY(0) rotate(-1deg); }
+      50% { transform: translateY(-18px) rotate(2deg); }
+    }
+
+
+  
+    .avatar-pill {
+      width: 2.4rem;
+      height: 2.4rem;
+      border-radius: 999px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(148, 163, 184, 0.75);
+      cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+    }
+
+    .avatar-pill:hover {
+      transform: translateY(-1px) scale(1.03);
+    }
+
+    .avatar-pill.selected {
+      border-color: rgba(56, 189, 248, 1);
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.7);
+      background: radial-gradient(circle at top, rgba(56, 189, 248, 0.4), rgba(15, 23, 42, 0.98));
+    }
