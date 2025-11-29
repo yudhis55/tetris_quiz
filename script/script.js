@@ -653,6 +653,9 @@ const QUESTIONS = [
   },
 ];
 
+// Loaded from DB (if available)
+let loadedQuestions = null;
+
 /* ---------- HELPER: SHUFFLE ---------- */
 function shuffleArray(arr) {
   const a = [...arr];
@@ -668,10 +671,13 @@ let config = { ...defaultConfig };
 let currentRecordCount = 0;
 let currentPlayerName = "";
 let currentPlayerClass = "";
+let currentUserId = null; // supabase auth user id
 // tracking waktu dan status penyimpanan
 let gameStartTime = null; // timestamp ms
 let scoreSaved = false;
 let feedbackTimeout = null;
+// per-session answer tracking: map quiz_id -> final answer/result
+let sessionQuestionMap = {}; // { [quizId]: { answer_given, is_correct, score_increase, line_increase } }
 
 let board = Array.from({ length: 20 }, () => Array(10).fill(0));
 let currentPiece = null;
@@ -841,9 +847,44 @@ function clearLines() {
     }
   }
   if (linesCleared > 0) {
+    // capture current level (used for scoring) before we update lines
+    const levelBefore = level;
+    // update global counters
     lines += linesCleared;
-    score += linesCleared * 100 * level;
+    const linePoints = linesCleared * 100 * levelBefore;
+    score += linePoints;
     level = Math.floor(lines / 10) + 1;
+
+    // Attribute cleared lines and their points to the currently active question
+    try {
+      const currentQ =
+        activeQuestions && activeQuestions.length
+          ? activeQuestions[questionIndex % activeQuestions.length]
+          : null;
+      if (currentQ) {
+        const qid = currentQ.id;
+        const prev = sessionQuestionMap[qid] || {};
+        // ensure we have an initial_lines baseline (use previous lines before clear)
+        if (typeof prev.initial_lines === "undefined") {
+          prev.initial_lines = Math.max(0, lines - linesCleared);
+        }
+        prev.line_increase = (prev.line_increase || 0) + linesCleared;
+        // also add the line points to the question's score_increase so
+        // details + recap can be reconciled if you want them to sum.
+        prev.score_increase = (prev.score_increase || 0) + linePoints;
+        sessionQuestionMap[qid] = prev;
+        console.debug("[clearLines] attributed", {
+          quiz_id: qid,
+          linesCleared,
+          linePoints,
+          new_line_increase: prev.line_increase,
+          new_score_increase: prev.score_increase,
+        });
+      }
+    } catch (e) {
+      console.warn("Error attributing cleared lines to question:", e);
+    }
+
     playLineClearSound();
     updateDisplay();
   }
@@ -949,6 +990,14 @@ function showQuizForQuestion(q) {
   // reset flag saat ganti soal
   currentQuestionWasWrong = false;
 
+  // record baseline lines for this question so we can compute line_increase
+  // when the question is finally resolved (saved). Do not overwrite if
+  // an entry already exists (for example, if the user already attempted it).
+  if (!sessionQuestionMap[q.id]) {
+    sessionQuestionMap[q.id] = { initial_lines: lines };
+  } else if (typeof sessionQuestionMap[q.id].initial_lines === "undefined") {
+    sessionQuestionMap[q.id].initial_lines = lines;
+  }
   updateSideQuiz(original, rotated, q);
 }
 
@@ -1017,6 +1066,52 @@ function handleQuizAnswer(answer) {
       }`;
     }
 
+    // compute line increase since question was shown
+    const baseline = (sessionQuestionMap[currentQ.id] || {}).initial_lines;
+    const lineIncrease =
+      typeof baseline === "number" ? Math.max(0, lines - baseline) : 0;
+
+    // record final result for this question.
+    // Important: if the question was previously answered WRONG and then
+    // later answered CORRECT (with no points), we preserve the "wrong"
+    // result so it will be saved as incorrect. We do still record the
+    // observed line increase (if any) so the DB reflects lines gained.
+    try {
+      const prev = sessionQuestionMap[currentQ.id] || {};
+      if (currentQuestionWasWrong) {
+        // keep is_correct=false and keep the first wrong answer_given
+        sessionQuestionMap[currentQ.id] = {
+          answer_given: prev.answer_given || answer,
+          is_correct: false,
+          score_increase: prev.score_increase || 0,
+          line_increase: (prev.line_increase || 0) + lineIncrease,
+          initial_lines: prev.initial_lines,
+        };
+      } else {
+        // never wrong: record correct result
+        sessionQuestionMap[currentQ.id] = {
+          answer_given: answer,
+          is_correct: true,
+          score_increase: add,
+          line_increase: lineIncrease,
+          initial_lines: prev.initial_lines,
+        };
+      }
+    } catch (e) {
+      console.warn("recordAnswer error:", e);
+    }
+
+    // DEBUG: log what we recorded for this question
+    try {
+      console.debug("[quiz-record] resolved question", currentQ.id, {
+        initial_lines: sessionQuestionMap[currentQ.id].initial_lines,
+        current_lines: lines,
+        computed_line_increase: sessionQuestionMap[currentQ.id].line_increase,
+        score_increase: sessionQuestionMap[currentQ.id].score_increase,
+        is_correct: sessionQuestionMap[currentQ.id].is_correct,
+      });
+    } catch (e) {}
+
     feedbackEl.className =
       "text-center text-sm font-bold text-green-400 bg-white/10 p-2 rounded-lg border border-green-400/40";
     quizActive = false;
@@ -1036,6 +1131,31 @@ function handleQuizAnswer(answer) {
     feedbackEl.className =
       "text-center text-sm font-bold text-red-400 bg-white/10 p-2 rounded-lg border border-red-400/40";
     playWrongSound();
+    // record the wrong attempt (will be overwritten if later corrected)
+    try {
+      // preserve existing initial_lines if present
+      const prev = sessionQuestionMap[currentQ.id] || {};
+      sessionQuestionMap[currentQ.id] = {
+        answer_given: answer,
+        is_correct: false,
+        score_increase: 0,
+        line_increase: prev.line_increase || 0,
+        initial_lines: prev.initial_lines,
+      };
+    } catch (e) {
+      console.warn("recordAnswer error:", e);
+    }
+
+    // DEBUG: log wrong attempt state
+    try {
+      console.debug("[quiz-record] wrong attempt", currentQ.id, {
+        initial_lines: sessionQuestionMap[currentQ.id].initial_lines,
+        current_lines: lines,
+        line_increase_so_far: sessionQuestionMap[currentQ.id].line_increase,
+        answer_given: sessionQuestionMap[currentQ.id].answer_given,
+      });
+    } catch (e) {}
+
     feedbackTimeout = setTimeout(() => {
       feedbackEl.classList.add("hidden");
       feedbackEl.textContent = "";
@@ -1155,68 +1275,118 @@ async function saveScore() {
   const durationSeconds = gameStartTime
     ? Math.floor((Date.now() - gameStartTime) / 1000)
     : null;
+  // compute true/false counts from sessionQuestionMap
+  const entries = Object.values(sessionQuestionMap || {});
+  const trueCount = entries.filter((e) => e.is_correct).length;
+  const falseCount = entries.filter((e) => !e.is_correct).length;
 
-  const payload = {
-    name: currentPlayerName,
-    class: currentPlayerClass,
+  // DEBUG: show session summary and reconciliation info before saving
+  try {
+    const detailSumScore = entries.reduce(
+      (s, e) => s + (e.score_increase || 0),
+      0
+    );
+    const detailSumLines = entries.reduce(
+      (s, e) => s + (e.line_increase || 0),
+      0
+    );
+    console.debug("[save-debug] sessionQuestionMap summary", {
+      total_quiz_entries: entries.length,
+      detailSumScore,
+      detailSumLines,
+      recap_score: score,
+      recap_lines: lines,
+    });
+  } catch (e) {}
+
+  // Try to get current auth user id if not already set
+  if (!currentUserId && supabaseClient && supabaseClient.auth) {
+    try {
+      const { data: userData } = await supabaseClient.auth.getUser();
+      if (userData && userData.user) currentUserId = userData.user.id;
+    } catch (e) {
+      console.warn("Could not get auth user id:", e);
+    }
+  }
+
+  if (!currentUserId) {
+    console.error("No authenticated user id found — cannot save score to DB");
+    if (saveBtn) {
+      saveBtn.textContent = "Login diperlukan";
+      saveBtn.disabled = false;
+    }
+    return;
+  }
+
+  // recap payload (matches your DB schema)
+  const recapPayload = {
+    user_profile_id: currentUserId,
     score: score,
     line: lines,
     duration: durationSeconds,
+    true_answer: trueCount,
+    false_answer: falseCount,
   };
 
-  if (window.dataSdk && window.dataSdk.create) {
-    try {
-      const result = await window.dataSdk.create(payload);
-      if (result.isOk) {
-        scoreSaved = true;
-        if (saveBtn) {
-          saveBtn.textContent = "Tersimpan!";
-          setTimeout(() => {
-            saveBtn.textContent = "Simpan Skor";
-            saveBtn.disabled = false;
-          }, 1500);
-        }
-      } else {
+  try {
+    // insert recap and get its id
+    const { data: recapData, error: recapErr } = await supabaseClient
+      .from("score_recap")
+      .insert(recapPayload)
+      .select("id")
+      .single();
+
+    if (recapErr) {
+      console.error("Gagal menyimpan score_recap:", recapErr);
+      if (saveBtn) {
+        saveBtn.textContent = "Error - Coba Lagi";
+        saveBtn.disabled = false;
+      }
+      return;
+    }
+
+    const recapId = recapData?.id;
+
+    // prepare details payload from sessionQuestionMap
+    const detailsPayload = Object.entries(sessionQuestionMap || {}).map(
+      ([quizId, v]) => ({
+        score_recap_id: recapId,
+        user_profile_id: currentUserId,
+        quiz_id: Number(quizId),
+        answer_given: v.answer_given,
+        is_correct: v.is_correct,
+        line_increase: v.line_increase || 0,
+        score_increase: v.score_increase || 0,
+      })
+    );
+
+    if (detailsPayload.length > 0) {
+      const { error: detailsErr } = await supabaseClient
+        .from("score_detail")
+        .insert(detailsPayload);
+      if (detailsErr) {
+        console.error("Gagal menyimpan score_detail:", detailsErr);
         if (saveBtn) {
           saveBtn.textContent = "Error - Coba Lagi";
           saveBtn.disabled = false;
         }
-      }
-    } catch (err) {
-      console.error("dataSdk create error:", err);
-      if (saveBtn) {
-        saveBtn.textContent = "Error - Coba Lagi";
-        saveBtn.disabled = false;
+        return;
       }
     }
-  } else {
-    // fallback: simpan ke Supabase
-    try {
-      const { error } = await supabaseClient
-        .from("score_recap")
-        .insert(payload);
-      if (error) {
-        console.error("Gagal menyimpan ke Supabase (fallback):", error);
-        if (saveBtn) {
-          saveBtn.textContent = "Error - Coba Lagi";
-          saveBtn.disabled = false;
-        }
-      } else {
-        scoreSaved = true;
-        if (saveBtn) {
-          saveBtn.textContent = "Tersimpan!";
-          setTimeout(() => {
-            saveBtn.textContent = "Simpan Skor";
-            saveBtn.disabled = false;
-          }, 1500);
-        }
-      }
-    } catch (err) {
-      console.error("Fallback save error:", err);
-      if (saveBtn) {
-        saveBtn.textContent = "Error - Coba Lagi";
+
+    scoreSaved = true;
+    if (saveBtn) {
+      saveBtn.textContent = "Tersimpan!";
+      setTimeout(() => {
+        saveBtn.textContent = "Simpan Skor";
         saveBtn.disabled = false;
-      }
+      }, 1500);
+    }
+  } catch (err) {
+    console.error("Error saving recap/details:", err);
+    if (saveBtn) {
+      saveBtn.textContent = "Error - Coba Lagi";
+      saveBtn.disabled = false;
     }
   }
 }
@@ -1296,43 +1466,199 @@ if (avatarButtons && avatarButtons.length) {
 /* ---------- EVENTS ---------- */
 document.getElementById("loginForm").addEventListener("submit", (e) => {
   e.preventDefault();
+  // Authentication flow: either login or register depending on selected mode
+  const authMode = window.__authMode || "login";
+  const email = document.getElementById("emailInput").value.trim();
+  const password = document.getElementById("passwordInput").value;
   const name = document.getElementById("nameInput").value.trim();
   const pclass = document.getElementById("classInput").value.trim();
-  if (name && pclass) {
-    currentPlayerName = name;
-    currentPlayerClass = pclass;
-    document.getElementById("playerInfo").textContent = name;
-    document.getElementById("classInfo").textContent = pclass;
 
-    // setiap login: acak ulang urutan soal
-    activeQuestions = shuffleArray(QUESTIONS);
-    questionIndex = 0;
-    currentQuestionWasWrong = false;
-
-    document.getElementById("loginScreen").classList.add("hidden");
-    document.getElementById("gameScreen").classList.remove("hidden");
-    document.getElementById("gameScreen").classList.add("flex");
-    initBoard();
-    drawBoard();
-    // start duration tracking
-    gameStartTime = Date.now();
-    scoreSaved = false;
-    spawnPiece();
+  if (!email || !password) {
+    alert("Masukkan email dan password");
+    return;
   }
+
+  (async () => {
+    try {
+      if (authMode === "register") {
+        if (!name || !pclass) {
+          alert("Untuk registrasi, masukkan nama dan kelas");
+          return;
+        }
+        const { data, error } = await supabaseClient.auth.signUp({
+          email,
+          password,
+        });
+        if (error) {
+          console.error("Signup error:", error);
+          alert("Gagal registrasi: " + error.message);
+          return;
+        }
+
+        const user = data?.user;
+        if (user) {
+          currentUserId = user.id;
+          // create user_profile row with id = auth user id
+          const { error: pErr } = await supabaseClient
+            .from("user_profile")
+            .insert({
+              id: user.id,
+              name: name,
+              class: pclass,
+            });
+          if (pErr) console.error("Failed to create user_profile:", pErr);
+
+          // set current player and start game
+          currentPlayerName = name;
+          currentPlayerClass = pclass;
+          startPlayerSession();
+        } else {
+          alert(
+            "Registrasi terkirim. Silakan cek email untuk verifikasi jika diperlukan."
+          );
+        }
+      } else {
+        // login
+        const { data, error } = await supabaseClient.auth.signInWithPassword({
+          email,
+          password,
+        });
+        if (error) {
+          console.error("Login error:", error);
+          alert("Gagal login: " + error.message);
+          return;
+        }
+        const user = data?.user;
+        if (user) {
+          currentUserId = user.id;
+          // fetch profile
+          const { data: profile, error: pErr } = await supabaseClient
+            .from("user_profile")
+            .select("*")
+            .eq("id", user.id)
+            .single();
+          if (pErr) {
+            console.warn("No profile found (or error):", pErr);
+          }
+          if (profile) {
+            currentPlayerName = profile.name || "";
+            currentPlayerClass = profile.class || "";
+          } else {
+            // if no profile, use provided name/class if present and create profile
+            if (name && pclass) {
+              const { error: createErr } = await supabaseClient
+                .from("user_profile")
+                .insert({
+                  id: user.id,
+                  name,
+                  class: pclass,
+                });
+              if (createErr)
+                console.error(
+                  "Failed to create profile after login:",
+                  createErr
+                );
+              currentPlayerName = name;
+              currentPlayerClass = pclass;
+            } else {
+              currentPlayerName = "";
+              currentPlayerClass = "";
+            }
+          }
+
+          startPlayerSession();
+        }
+      }
+    } catch (err) {
+      console.error("Auth error:", err);
+      alert("Terjadi kesalahan saat autentikasi");
+    }
+  })();
 });
 
-document.getElementById("logoutBtn").addEventListener("click", () => {
-  if (gameLoop) {
-    clearInterval(gameLoop);
-    gameLoop = null;
-  }
-  document.getElementById("gameScreen").classList.add("hidden");
-  document.getElementById("loginScreen").classList.remove("hidden");
-  document.getElementById("nameInput").value = "";
-  document.getElementById("classInput").value = "";
-  resetGame();
-  gameStartTime = null;
+// helper to start session after auth/profile ready
+function startPlayerSession() {
+  document.getElementById("playerInfo").textContent = currentPlayerName || "-";
+  document.getElementById("classInfo").textContent = currentPlayerClass || "-";
+
+  // setiap login: gunakan quiz dari DB jika tersedia, otherwise fallback
+  activeQuestions = shuffleArray(
+    loadedQuestions && loadedQuestions.length ? loadedQuestions : QUESTIONS
+  );
+  questionIndex = 0;
+  currentQuestionWasWrong = false;
+
+  document.getElementById("loginScreen").classList.add("hidden");
+  document.getElementById("gameScreen").classList.remove("hidden");
+  document.getElementById("gameScreen").classList.add("flex");
+  initBoard();
+  drawBoard();
+  // start duration tracking
+  gameStartTime = Date.now();
   scoreSaved = false;
+  spawnPiece();
+}
+
+// --- Auth mode toggle (Login / Register) ---
+window.__authMode = "login";
+const authLoginBtn = document.getElementById("authModeLogin");
+const authRegisterBtn = document.getElementById("authModeRegister");
+const profileFields = document.getElementById("profileFields");
+const startGameBtn = document.getElementById("startGameBtn");
+function setAuthMode(mode) {
+  window.__authMode = mode;
+  if (mode === "register") {
+    if (profileFields) profileFields.classList.remove("hidden");
+    if (authLoginBtn) authLoginBtn.classList.remove("bg-white/10");
+    if (authLoginBtn)
+      authLoginBtn.classList.add("bg-transparent", "text-white/60");
+    if (authRegisterBtn) authRegisterBtn.classList.add("bg-white/10");
+    if (startGameBtn)
+      startGameBtn.innerHTML =
+        '<span class="text-lg">▶️</span><span>Registrasi & Mulai</span>';
+  } else {
+    if (profileFields) profileFields.classList.add("hidden");
+    if (authLoginBtn) authLoginBtn.classList.add("bg-white/10");
+    if (authLoginBtn)
+      authLoginBtn.classList.remove("bg-transparent", "text-white/60");
+    if (authRegisterBtn) authRegisterBtn.classList.remove("bg-white/10");
+    if (startGameBtn)
+      startGameBtn.innerHTML =
+        '<span class="text-lg">▶️</span><span>Mulai Bermain</span>';
+  }
+}
+if (authLoginBtn)
+  authLoginBtn.addEventListener("click", () => setAuthMode("login"));
+if (authRegisterBtn)
+  authRegisterBtn.addEventListener("click", () => setAuthMode("register"));
+// initialize UI
+setAuthMode("login");
+
+document.getElementById("logoutBtn").addEventListener("click", () => {
+  (async () => {
+    if (gameLoop) {
+      clearInterval(gameLoop);
+      gameLoop = null;
+    }
+    try {
+      await supabaseClient.auth.signOut();
+    } catch (err) {
+      console.warn("Sign out error:", err);
+    }
+    document.getElementById("gameScreen").classList.add("hidden");
+    document.getElementById("loginScreen").classList.remove("hidden");
+    const emailEl = document.getElementById("emailInput");
+    const passEl = document.getElementById("passwordInput");
+    const nameEl = document.getElementById("nameInput");
+    const classEl = document.getElementById("classInput");
+    if (emailEl) emailEl.value = "";
+    if (passEl) passEl.value = "";
+    if (nameEl) nameEl.value = "";
+    if (classEl) classEl.value = "";
+    resetGame();
+    gameStartTime = null;
+    scoreSaved = false;
+  })();
 });
 
 document.addEventListener("keydown", (e) => {
@@ -1455,7 +1781,88 @@ async function onConfigChange(newConfig) {
     newConfig.primary_color || defaultConfig.primary_color;
 }
 
+/**
+ * Load quiz rows from Supabase `quiz` table and map to local format.
+ * Expected DB columns (as provided):
+ * - id, piece, start_rotation, target_rotation, prompt, options,
+ *   correct_answer, indicators, explanations, created_at, updated_at
+ */
+async function loadQuestionsFromDb() {
+  if (!supabaseClient) return null;
+  try {
+    const { data, error } = await supabaseClient
+      .from("quiz")
+      .select("*")
+      .order("id", { ascending: true });
+    if (error) {
+      console.error("Failed to load quiz from DB:", error);
+      return null;
+    }
+    if (!Array.isArray(data)) return null;
+
+    const mapped = data.map((r) => {
+      // options may be stored as JSON or as JS array already
+      let options = r.options;
+      if (typeof options === "string") {
+        try {
+          options = JSON.parse(options);
+        } catch (e) {
+          console.warn("Could not parse options JSON for quiz id", r.id, e);
+          options = [];
+        }
+      }
+
+      // indicators may be stored as array or JSON string
+      let indicators = r.indicators;
+      if (typeof indicators === "string") {
+        try {
+          indicators = JSON.parse(indicators);
+        } catch (e) {
+          indicators = [];
+        }
+      }
+
+      return {
+        id: r.id,
+        piece: r.piece,
+        startRotation:
+          typeof r.start_rotation !== "undefined" ? r.start_rotation : 0,
+        targetRotation:
+          typeof r.target_rotation !== "undefined" && r.target_rotation !== null
+            ? r.target_rotation
+            : r.start_rotation || 0,
+        prompt: r.prompt,
+        options: Array.isArray(options) ? options : [],
+        correctAnswer: r.correct_answer,
+        indicators: Array.isArray(indicators) ? indicators : [],
+        explanation: r.explanations || r.explanation || "",
+      };
+    });
+
+    return mapped;
+  } catch (err) {
+    console.error("Error while loading quiz from DB:", err);
+    return null;
+  }
+}
+
 async function init() {
+  // try to load quiz questions from Supabase early so they are available
+  // when a player logs in. If loading fails we'll keep the static QUESTIONS.
+  try {
+    const loaded = await loadQuestionsFromDb();
+    if (Array.isArray(loaded) && loaded.length) {
+      loadedQuestions = loaded;
+      console.log("Quiz loaded from DB:", loadedQuestions.length);
+    } else {
+      console.log("No quiz rows loaded from DB, using bundled QUESTIONS");
+    }
+  } catch (err) {
+    console.warn(
+      "Error loading quiz from DB (continuing with static QUESTIONS):",
+      err
+    );
+  }
   if (window.dataSdk && window.dataSdk.init) {
     const initResult = await window.dataSdk.init(dataHandler);
     if (!initResult.isOk) {
@@ -1473,6 +1880,7 @@ async function init() {
             get: () => cfg.background_color || defaultConfig.background_color,
             set: (v) => {
               config.background_color = v;
+
               window.elementSdk.setConfig({ background_color: v });
             },
           },
